@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
@@ -68,7 +69,7 @@ export async function probeBridge(
 
 export type BridgeObservation =
   | { state: "healthy"; runtime: RuntimeState }
-  | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" }
+  | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" | "pid_reused" }
   | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" };
 
 function observePid(pid: number): "present" | "missing" | "unknown" {
@@ -79,6 +80,25 @@ function observePid(pid: number): "present" | "missing" | "unknown" {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "unknown";
   }
+}
+
+/**
+ * A runtime PID can be reused after a bridge exits. On Windows a bare
+ * `process.kill(pid, 0)` therefore cannot prove that the process is still the
+ * Node bridge we launched. Reject a positively identified non-Node process so
+ * the daemon can recover from stale runtime metadata; retain fail-closed
+ * `unknown` behavior whenever the process identity cannot be established.
+ */
+function windowsProcessIsNode(pid: number): boolean | null {
+  if (process.platform !== "win32") return null;
+  const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) return null;
+  const imageName = result.stdout.trim().match(/^"([^"]+)"/)?.[1]?.toLowerCase();
+  if (!imageName || imageName === "info:") return null;
+  return imageName === "node.exe" || imageName === "node";
 }
 
 /**
@@ -99,6 +119,9 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
 
   const pid = observePid(runtime.pid);
   if (pid === "missing") return { state: "stopped", runtime, reason: "pid_missing" };
+  if (pid === "present" && windowsProcessIsNode(runtime.pid) === false) {
+    return { state: "stopped", runtime, reason: "pid_reused" };
+  }
   return { state: "unknown", runtime, reason: pid === "unknown" ? "pid_unknown" : "probe_failed" };
 }
 

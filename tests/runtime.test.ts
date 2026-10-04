@@ -5,6 +5,7 @@ import { startBridge } from "../src/bridge/server.js";
 import {
   findBridgeObservation,
   findLiveBridge,
+  readRuntimeState,
   writeRuntimeState,
   type RuntimeState,
 } from "../src/bridge/runtime.js";
@@ -91,6 +92,33 @@ describe("findBridgeObservation", () => {
     }
   });
 
+  it.runIf(process.platform === "win32")("treats a reused PID owned by a non-Node process as stopped", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-pid-reused");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    // Keep a known non-Node process alive while tasklist verifies its image.
+    const helper = spawn("powershell.exe", ["-NoProfile", "-Command", "Start-Sleep -Seconds 20"], {
+      stdio: "ignore",
+    });
+    try {
+      if (!helper.pid) throw new Error("failed to spawn helper");
+      writeRuntimeState(stubRuntime(workspace.id, workspace.root, helper.pid, 1));
+      const observation = await findBridgeObservation(workspace.id);
+      expect(observation.state).toBe("stopped");
+      if (observation.state === "stopped") expect(observation.reason).toBe("pid_reused");
+    } finally {
+      if (helper.pid) {
+        try {
+          process.kill(helper.pid, "SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  });
+
   it("reports healthy when the local bridge answers", async () => {
     dirs.push(isolateStateDir());
     const root = makeTmpDir("obs-live");
@@ -98,6 +126,9 @@ describe("findBridgeObservation", () => {
     write(root, "a.txt", "a");
     const auth = path.join(makeTmpDir("obs-auth"), "store.json");
     dirs.push(path.dirname(auth));
+    const unregisteredRoot = makeTmpDir("obs-unregistered");
+    dirs.push(unregisteredRoot);
+    const unregistered = new Workspace(unregisteredRoot);
     const bridge = await startBridge({
       workspaceRoot: root,
       port: 0,
@@ -108,8 +139,56 @@ describe("findBridgeObservation", () => {
       const observation = await findBridgeObservation(bridge.workspace.id);
       expect(observation.state).toBe("healthy");
       expect(await findLiveBridge(bridge.workspace.id)).not.toBeNull();
+      expect(readRuntimeState(bridge.workspace.id)).toMatchObject({
+        workspaceId: bridge.workspace.id,
+        workspaceRoot: bridge.workspace.root,
+        port: bridge.port,
+        pid: process.pid,
+        adminToken: bridge.adminToken,
+      });
+      expect(readRuntimeState(unregistered.id)).toBeNull();
     } finally {
       await bridge.close();
     }
+    expect(readRuntimeState(bridge.workspace.id)).toBeNull();
+  });
+
+  it("publishes and clears a truthful runtime record for every registered workspace", async () => {
+    dirs.push(isolateStateDir());
+    const primaryRoot = makeTmpDir("runtime-primary");
+    const registeredRoot = makeTmpDir("runtime-registered");
+    dirs.push(primaryRoot, registeredRoot);
+    write(primaryRoot, "a.txt", "primary");
+    write(registeredRoot, "b.txt", "registered");
+    const primary = new Workspace(primaryRoot);
+    const registered = new Workspace(registeredRoot);
+    const auth = path.join(makeTmpDir("runtime-auth"), "store.json");
+    dirs.push(path.dirname(auth));
+    const bridge = await startBridge({
+      workspaceRoot: primaryRoot,
+      workspaceRoots: { [registered.id]: registeredRoot },
+      port: 0,
+      persistRuntime: true,
+      authStoreFile: auth,
+    });
+    try {
+      const primaryState = readRuntimeState(primary.id);
+      const registeredState = readRuntimeState(registered.id);
+      expect(primaryState).not.toBeNull();
+      expect(registeredState).not.toBeNull();
+      expect(primaryState).toMatchObject({
+        workspaceId: primary.id,
+        workspaceRoot: primary.root,
+        pid: process.pid,
+        port: bridge.port,
+        adminToken: bridge.adminToken,
+        publicUrl: null,
+      });
+      expect(registeredState).toEqual({ ...primaryState!, workspaceId: registered.id, workspaceRoot: registered.root });
+    } finally {
+      await bridge.close();
+    }
+    expect(readRuntimeState(primary.id)).toBeNull();
+    expect(readRuntimeState(registered.id)).toBeNull();
   });
 });

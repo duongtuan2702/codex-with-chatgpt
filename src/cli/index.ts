@@ -194,9 +194,9 @@ interface AdminInfo {
 
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
-  opts: { tunnel: boolean }
+  opts: { tunnel: boolean; workspaceRegistry?: string }
 ): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot);
+  const { runtime } = await ensureBridge(workspaceRoot, { workspaceRegistry: opts.workspaceRegistry });
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
@@ -231,11 +231,29 @@ program
   .command("serve", { hidden: true })
   .description("Run the bridge in the foreground (internal)")
   .requiredOption("--workspace <path>")
+  .option("--workspace-registry <path>", "machine-local JSON map of workspace IDs to registered roots")
   .option("--port <port>", "preferred port")
-  .action(async (opts: { workspace: string; port?: string }) => {
+  .action(async (opts: { workspace: string; workspaceRegistry?: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
+    let workspaceRoots: Record<string, string> | undefined;
+    if (opts.workspaceRegistry) {
+      const registryText = fs.readFileSync(opts.workspaceRegistry, "utf8").replace(/^\uFEFF/, "");
+      const parsed: unknown = JSON.parse(registryText);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Workspace registry must be a JSON object mapping workspace IDs to root paths");
+      }
+      workspaceRoots = {};
+      for (const [id, root] of Object.entries(parsed)) {
+        if (typeof root !== "string" || !root.trim()) {
+          throw new Error("Workspace registry entries must map IDs to non-empty root paths");
+        }
+        workspaceRoots[id] = root;
+      }
+    }
     const bridge = await startBridge({
       workspaceRoot: resolveWorkspace(opts.workspace),
+      workspaceRoots,
+      workspaceRegistryFile: opts.workspaceRegistry ? path.resolve(opts.workspaceRegistry) : undefined,
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
     });
@@ -253,12 +271,16 @@ program
   .command("start")
   .description("Start (or reuse) the bridge for this workspace")
   .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
+  .option("--workspace-registry <path>", "machine-local JSON map of workspace IDs to registered roots")
   .option("--tunnel", "also establish the secure public connection", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
+  .action(async (opts: { workspace?: string; workspaceRegistry?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, {
+        tunnel: opts.tunnel,
+        workspaceRegistry: opts.workspaceRegistry,
+      });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -366,13 +388,17 @@ program
   .command("restart")
   .description("Restart the bridge for this workspace")
   .option("-w, --workspace <path>")
+  .option("--workspace-registry <path>", "machine-local JSON map of workspace IDs to registered roots")
   .option("--tunnel", "re-establish the secure public connection", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean }) => {
+  .action(async (opts: { workspace?: string; workspaceRegistry?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     await stopBridge(root);
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, {
+        tunnel: opts.tunnel,
+        workspaceRegistry: opts.workspaceRegistry,
+      });
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
@@ -1173,6 +1199,220 @@ program
       else check("已记录执行摘要");
     }
   );
+
+// ------------------------------------------------------------------------ c2c mailbox
+
+const mailboxCmd = program
+  .command("mailbox")
+  .description("C2C Mailbox — control-plane message store (PLAN_REQUEST / PLAN_RESPONSE / EXECUTION_REPORT / REVIEW_RESPONSE)");
+
+// c2c mailbox submit
+mailboxCmd
+  .command("submit")
+  .description("Submit any mailbox message type (PLAN_REQUEST, PLAN_RESPONSE, EXECUTION_REPORT, REVIEW_RESPONSE, ERROR)")
+  .requiredOption("--type <type>", "PLAN_REQUEST | PLAN_RESPONSE | EXECUTION_REPORT | REVIEW_RESPONSE | ERROR")
+  .requiredOption("--request-id <id>", "Stable request ID (e.g. uuid)")
+  .requiredOption("--round <n>", "Round number (integer)")
+  .option("--payload <json>", "JSON payload (string or @filename to read from file)")
+  .option("--payload-file <path>", "Read payload from a local JSON file")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    type: string;
+    requestId: string;
+    round: string;
+    payload?: string;
+    payloadFile?: string;
+    workspace?: string;
+    json: boolean;
+  }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      const { runtime } = await ensureBridge(root);
+      const body: Record<string, unknown> = {
+        type: opts.type,
+        request_id: opts.requestId,
+        round: parseInt(opts.round, 10),
+      };
+
+      // Read payload from file or inline
+      if (opts.payloadFile) {
+        const fs = await import("node:fs");
+        body.payload = JSON.parse(fs.readFileSync(opts.payloadFile, "utf8"));
+      } else if (opts.payload) {
+        body.payload = JSON.parse(opts.payload);
+      } else {
+        throw new Error("Either --payload or --payload-file is required");
+      }
+
+      const result = await adminFetch<Record<string, unknown>>(runtime, "POST", "/admin/mailbox/submit", 10_000, body);
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...result }));
+      } else {
+        check(`Đã lưu ${result.type} message_id=${result.message_id} is_duplicate=${result.is_duplicate}`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// c2c mailbox list
+mailboxCmd
+  .command("list", { isDefault: true })
+  .description("List pending mailbox messages")
+  .option("-w, --workspace <path>")
+  .option("--request-id <id>", "Filter by request ID")
+  .option("--type <type>", "Filter by type (PLAN_REQUEST, PLAN_RESPONSE, EXECUTION_REPORT, REVIEW_RESPONSE, ERROR)")
+  .option("--min-round <n>", "Minimum round number")
+  .option("--limit <n>", "Max results (default 20, max 100)", "20")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    workspace?: string;
+    requestId?: string;
+    type?: string;
+    minRound?: string;
+    limit?: string;
+    json: boolean;
+  }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      const { runtime } = await ensureBridge(root);
+      const params = new URLSearchParams();
+      if (opts.requestId) params.set("request_id", opts.requestId);
+      if (opts.type) params.set("type", opts.type);
+      if (opts.minRound) params.set("min_round", opts.minRound);
+      params.set("limit", opts.limit ?? "20");
+      const result = await adminFetch<{ messages: unknown[]; total: number }>(
+        runtime, "GET", `/admin/mailbox/list?${params.toString()}`
+      );
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...result }));
+      } else {
+        say(`Tin nhắn đang chờ: ${result.total}`);
+        for (const msg of result.messages as Array<{ message_id: string; type: string; request_id: string; round: number; created_at: string }>) {
+          say(`  [${msg.type}] round=${msg.round} request=${msg.request_id} id=${msg.message_id.slice(0, 8)}… created=${msg.created_at.slice(0, 16)}`);
+        }
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// c2c mailbox get
+mailboxCmd
+  .command("get")
+  .description("Get a specific mailbox message by message_id")
+  .requiredOption("--message-id <id>", "The message_id to retrieve")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { messageId: string; workspace?: string; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      const { runtime } = await ensureBridge(root);
+      const result = await adminFetch<Record<string, unknown>>(
+        runtime, "GET", `/admin/mailbox/get?message_id=${encodeURIComponent(opts.messageId)}`
+      );
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...result }));
+      } else {
+        say(JSON.stringify(result, null, 2));
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// c2c mailbox latest
+mailboxCmd
+  .command("latest")
+  .description("Get the latest message of a given type for a request")
+  .requiredOption("--request-id <id>", "Request ID")
+  .requiredOption("--type <type>", "Message type")
+  .option("--min-round <n>", "Minimum round number")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { requestId: string; type: string; minRound?: string; workspace?: string; json: boolean }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      const { runtime } = await ensureBridge(root);
+      const params = new URLSearchParams({ request_id: opts.requestId, type: opts.type });
+      if (opts.minRound) params.set("min_round", opts.minRound);
+      const result = await adminFetch<Record<string, unknown>>(
+        runtime, "GET", `/admin/mailbox/latest?${params.toString()}`
+      );
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...result }));
+      } else {
+        say(JSON.stringify(result, null, 2));
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// c2c mailbox wait (polling helper)
+mailboxCmd
+  .command("wait")
+  .description("Poll for a specific mailbox message until it appears or timeout")
+  .requiredOption("--request-id <id>", "Request ID")
+  .requiredOption("--type <type>", "Expected message type (PLAN_RESPONSE, REVIEW_RESPONSE)")
+  .option("--min-round <n>", "Minimum round (default 1)", "1")
+  .option("--interval <seconds>", "Poll interval in seconds (default 3)", "3")
+  .option("--timeout <seconds>", "Timeout in seconds (default 120)", "120")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    requestId: string;
+    type: string;
+    minRound?: string;
+    interval?: string;
+    timeout?: string;
+    workspace?: string;
+    json: boolean;
+  }) => {
+    const root = resolveWorkspace(opts.workspace);
+    try {
+      const { runtime } = await ensureBridge(root);
+      const intervalSec = parseInt(opts.interval ?? "3", 10);
+      const timeoutSec = parseInt(opts.timeout ?? "120", 10);
+      const minRound = parseInt(opts.minRound ?? "1", 10);
+      const deadline = Date.now() + timeoutSec * 1000;
+      const params = new URLSearchParams({
+        request_id: opts.requestId,
+        type: opts.type,
+        min_round: String(minRound),
+      });
+
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        if (Date.now() > deadline) {
+          if (opts.json) {
+            say(JSON.stringify({ ok: false, error: "TIMEOUT", message: `No ${opts.type} found for request ${opts.requestId} within ${timeoutSec}s` }));
+          } else {
+            cross(`Đã hết thời gian chờ (${timeoutSec}s)`);
+          }
+          process.exitCode = 2;
+          return;
+        }
+        const result = await adminFetch<{ messages: Array<{ message_id: string; type: string; round: number; created_at: string; payload: unknown }> }>(
+          runtime, "GET", `/admin/mailbox/list?${params.toString()}&limit=1`
+        );
+        if (result.messages && result.messages.length > 0) {
+          if (opts.json) {
+            say(JSON.stringify({ ok: true, found: true, message: result.messages[0] }));
+          } else {
+            check(`Tìm thấy ${result.messages[0].type} round=${result.messages[0].round} message_id=${result.messages[0].message_id}`);
+            say(JSON.stringify(result.messages[0], null, 2));
+          }
+          return;
+        }
+        // Wait before next poll
+        await new Promise((r) => setTimeout(r, intervalSec * 1000));
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
 
 const tunnelCmd = program.command("tunnel").description("Choose or inspect the public connection for this workspace");
 

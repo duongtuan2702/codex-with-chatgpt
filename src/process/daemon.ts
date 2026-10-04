@@ -29,7 +29,10 @@ export interface EnsureBridgeResult {
  * Ensure a bridge is running for the workspace. Reuses a live instance,
  * otherwise spawns a detached daemon and waits for it to become healthy.
  */
-export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
+export async function ensureBridge(
+  workspaceRoot: string,
+  opts: { port?: number; workspaceRegistry?: string } = {}
+): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
   const observation = await findBridgeObservation(workspace.id);
   if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
@@ -52,11 +55,20 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
   const { cmd, args } = cliEntry();
   const child = spawn(
     cmd,
-    [...args, "serve", "--workspace", workspace.root, ...(opts.port ? ["--port", String(opts.port)] : [])],
+    [
+      ...args,
+      "serve",
+      "--workspace",
+      workspace.root,
+      ...(opts.workspaceRegistry ? ["--workspace-registry", path.resolve(opts.workspaceRegistry)] : []),
+      ...(opts.port ? ["--port", String(opts.port)] : []),
+    ],
     {
       detached: true,
       stdio: ["ignore", out, out],
-      env: { ...process.env },
+      env: { ...process.env,
+        ...(opts.workspaceRegistry ? { C2C_WORKSPACE_REGISTRY: path.resolve(opts.workspaceRegistry) } : {}),
+      },
       windowsHide: true,
     }
   );
@@ -79,14 +91,19 @@ export async function adminFetch<T = unknown>(
   runtime: RuntimeState,
   method: "GET" | "POST",
   route: string,
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  reqBody?: unknown,
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`http://127.0.0.1:${runtime.port}${route}`, {
       method,
-      headers: { Authorization: `Bearer ${runtime.adminToken}` },
+      headers: {
+        Authorization: `Bearer ${runtime.adminToken}`,
+        ...(reqBody !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      ...(reqBody !== undefined ? { body: JSON.stringify(reqBody) } : {}),
       signal: controller.signal,
     });
     const body = (await response.json().catch(() => ({}))) as T & { message?: string };
